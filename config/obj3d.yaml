@@ -1,0 +1,139 @@
+dataset:
+  name: obj3d
+  root: data/obj3d
+  train_split: train
+  validation_split: val
+  image_size: 64
+  frames: 1
+
+model:
+  num_slots: 6
+  appearance_dim: 64
+  encoder:
+    type: cnn
+    in_channels: 3
+    width: 64
+    feature_dim: 64
+  slot_attention:
+    qkv_dim: 64
+    grid_hidden_dim: 128
+    update_hidden_dim: 128
+    iterations_first: 3
+    iterations_rest: 2
+    scales_factor: 5.0
+    min_scale: 0.001
+    max_scale: 2.0
+    terminal_readout: true
+    terminal_gate_max: 0.5
+    terminal_gate_mode: channel
+  decoder:
+    image_size: 64
+    broadcast_size: 16
+    hidden_dim: 64
+    canonical_kernel: null
+    upsample_kernels: [5, 3]
+    output_kernels: [3, 3, 3]
+    rgb_kernel: 3
+    alpha_kernel: 1
+    rgb_micro: true
+    rgb_micro_eta_max: 0.5
+    s_ref: 0.2
+    coldstart_s_ref: 0.869226987
+    s_ref_hold_steps: 2000
+    s_ref_ramp_steps: 8000
+    gain_max: 2.0
+  temporal:
+    enabled: false
+  teacher_selector:
+    enabled: true
+    threshold: 0.73
+    max_delta: 2.0
+    label_max_delta: 2.0
+    takeover_margin: 0.001
+    border_width: 4
+    owned_min: 20
+    peak_min: 0.3
+    bg_score_eta: 0.25
+    learning_rate: 0.0003
+    weight_decay: 0.0001
+    warmup_steps: 25
+    max_grad_norm: 1.0
+    teacher:
+      bg_score_eta: 0.25
+      border_width: 4
+      owned_min: 20
+      peak_min: 0.3
+      attention_ratio_low: 1.2
+      attention_ratio_high: 1.8
+      positive_gain_low: 0.0
+      positive_gain_high: 0.05
+      harmful_gain_max: -0.02
+      individual_harmful_max: -0.05
+      label_max_delta: 2.0
+      local_bg_kernel: 9
+      local_bg_quantile: 0.95
+      local_bg_error_max: 5.0
+      local_bg_delta_max: 2.0
+      negative_weight: 2.0
+      rank_weight: 0.25
+      rank_temperature: 0.5
+      rank_margin: 0.5
+
+quality_filter:
+  owned_min: 20
+  owned_max_fraction: 0.6
+  alpha_peak_min: 0.3
+  scale_max: 0.3
+  effective_pixels_min: 2.0
+  effective_pixels_max_fraction: 0.75
+  max_attention_cosine: 0.5
+  boundary_z: 2.5
+  boundary_margin_pixels: 2.0
+  geometry_coherence:
+    compactness_min: null
+    position_residual_max: null
+    effective_pixels_min: null
+    owner_iou_min: null
+    max_attention_cosine: null
+
+loss:
+  reconstruction_weight: 1.0
+  position_weight: 0.2
+  overlap_weight: 0.01
+  geometry_weight: 0.002
+  compactness_weight: 0.25
+  onefg_gamma: 2.0
+  min_scale_ratio: 0.6
+  max_scale_ratio: 1.67
+  huber_delta: 0.05
+  terminal_gate_weight: 0.0001
+  position_max_support_coverage: null
+
+curriculum:
+  position_start_step: 15000
+  position_ramp_steps: 2000
+  geometry_start_step: 40000
+  geometry_ramp_steps: 2000
+  geometry_time_indices: [0]
+  selector_train_start_step: 35000
+  selector_apply_start_step: 36200
+  selector_apply_ramp_steps: 3800
+  temporal_start_step: 70001
+  temporal_warmup_steps: 0
+  temporal_learning_rate_multiplier: 0.0
+  phase12_frames: 1
+  phase3_frames: 1
+
+training:
+  seed: 42
+  max_steps: 70000
+  batch_size: 64
+  learning_rate: 0.0004
+  weight_decay: 0.0
+  max_grad_norm: 0.05
+  warmup_steps: 10000
+  mixed_precision: true
+  amp_dtype: bfloat16
+  compile_decoder: true
+  log_every: 10
+  checkpoint_every: 1000

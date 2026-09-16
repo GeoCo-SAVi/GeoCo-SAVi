@@ -1,0 +1,116 @@
+dataset:
+  name: movi_c
+  root: data/movi_c
+  train_split: train
+  validation_split: validation
+  image_size: 64
+  frames: 4
+
+model:
+  num_slots: 11
+  appearance_dim: 64
+  encoder:
+    type: dinov2
+    model_name: vit_small_patch14_dinov2.lvd142m
+    input_size: 336
+    native_dim: 384
+    feature_dim: 128
+    checkpoint: data/pretrained/dinov2_vits14.safetensors
+    pretrained: false
+  slot_attention:
+    qkv_dim: 64
+    grid_hidden_dim: 128
+    update_hidden_dim: 256
+    iterations_first: 3
+    iterations_rest: 2
+    scales_factor: 5.0
+    min_scale: 0.001
+    max_scale: 2.0
+    terminal_readout: false
+    terminal_gate_max: 0.5
+    terminal_gate_mode: channel
+  decoder:
+    image_size: 64
+    broadcast_size: 32
+    hidden_dim: 64
+    canonical_kernel: 5
+    upsample_kernels: [3]
+    output_kernels: [3, 3, 3]
+    rgb_kernel: 3
+    alpha_kernel: 1
+    rgb_micro: false
+    rgb_micro_eta_max: 0.5
+    s_ref: 0.2
+    coldstart_s_ref: 0.851256531
+    s_ref_hold_steps: 2000
+    s_ref_ramp_steps: 8000
+    gain_max: 2.0
+  temporal:
+    enabled: true
+    model_dim: 128
+    num_heads: 4
+    mlp_dim: 512
+    memory_size: 4
+    dropout: 0.0
+    detach_history: true
+  teacher_selector:
+    enabled: false
+
+quality_filter:
+  owned_min: 20
+  owned_max_fraction: 0.6
+  alpha_peak_min: 0.3
+  scale_max: 2.0
+  effective_pixels_min: 2.0
+  effective_pixels_max_fraction: 0.75
+  max_attention_cosine: 0.5
+  boundary_z: 2.5
+  boundary_margin_pixels: 2.0
+  geometry_coherence:
+    compactness_min: 1.0
+    position_residual_max: null
+    effective_pixels_min: 8
+    owner_iou_min: 0.6
+    max_attention_cosine: null
+
+loss:
+  reconstruction_weight: 1.0
+  position_weight: 0.04
+  overlap_weight: 0.018
+  geometry_weight: 0.004
+  compactness_weight: 0.25
+  onefg_gamma: 2.0
+  min_scale_ratio: 0.6
+  max_scale_ratio: 1.67
+  huber_delta: 0.05
+  terminal_gate_weight: 0.0
+  position_max_support_coverage: 0.2
+
+curriculum:
+  position_start_step: 15000
+  position_ramp_steps: 2000
+  geometry_start_step: 48000
+  geometry_ramp_steps: 2000
+  geometry_time_indices: [0, 2]
+  selector_train_start_step: 100001
+  selector_apply_start_step: 100001
+  selector_apply_ramp_steps: 0
+  temporal_start_step: 70000
+  temporal_warmup_steps: 2000
+  temporal_learning_rate_multiplier: 0.25
+  phase12_frames: 2
+  phase3_frames: 4
+
+training:
+  seed: 42
+  max_steps: 100000
+  batch_size: 16
+  learning_rate: 0.0004
+  weight_decay: 0.0
+  max_grad_norm: 0.05
+  warmup_steps: 10000
+  mixed_precision: true
+  amp_dtype: bfloat16
+  compile_decoder: true
+  log_every: 50
+  checkpoint_every: 1000

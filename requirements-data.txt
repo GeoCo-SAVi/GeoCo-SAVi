@@ -1,0 +1,7 @@
+-r requirements.txt
+
+Pillow>=10.0
+tensorflow>=2.15
+tensorflow-datasets>=4.9
+tqdm>=4.66
+webdataset>=0.2.86

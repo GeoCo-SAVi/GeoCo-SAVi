@@ -101,6 +101,8 @@ loss:
   position_weight: 0.2
   overlap_weight: 0.01
   geometry_weight: 0.002
+  tail_weight: 0.001
+  tail_threshold: 0.25
   compactness_weight: 0.25
   onefg_gamma: 2.0
   min_scale_ratio: 0.6
@@ -114,6 +116,8 @@ curriculum:
   position_ramp_steps: 2000
   geometry_start_step: 40000
   geometry_ramp_steps: 2000
+  center_normalize_start_step: 50000
+  tail_start_step: 60000
   geometry_time_indices: [0]
   selector_train_start_step: 35000
   selector_apply_start_step: 36200

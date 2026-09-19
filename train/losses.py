@@ -6,6 +6,24 @@ import torch.nn.functional as F
 from .geometry import onefg_support, support_moments
 
 
+def tail_penalty(
+    margin: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    threshold: float = 0.25,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    if not 0.0 < threshold < 1.0:
+        raise ValueError("tail threshold must lie between zero and one")
+    scaled = float(gamma) * margin.float()
+    selected = torch.sigmoid(scaled.detach()) < float(threshold)
+    per_object = (F.softplus(scaled) * selected).mean(dim=(-2, -1))
+    weights = weights.detach().to(per_object)
+    if weights.shape != per_object.shape:
+        raise ValueError("tail weights must match the object dimensions")
+    return (per_object * weights).sum() / weights.sum().clamp_min(1e-8)
+
+
 def reconstruction_loss(
     reconstruction: torch.Tensor,
     target: torch.Tensor,

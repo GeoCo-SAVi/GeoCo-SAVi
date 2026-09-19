@@ -22,25 +22,30 @@ def hard_slot_ownership(alpha: torch.Tensor) -> torch.Tensor:
     return F.one_hot(owner, alpha.shape[1]).permute(0, 3, 1, 2).to(alpha.dtype)
 
 
-def onefg_support(
+def onefg_margin(
     mask_logits: torch.Tensor,
     background_mask: torch.Tensor,
     *,
-    gamma: float = 2.0,
     allow_missing_background: bool = False,
+    background_source: torch.Tensor | None = None,
 ) -> torch.Tensor:
 
 
     logits = _mask_field(mask_logits, "mask_logits")
-    if background_mask.shape != logits.shape[:2]:
+    source = logits if background_source is None else _mask_field(
+        background_source, "background_source"
+    )
+    if source.shape[0] != logits.shape[0] or source.shape[-2:] != logits.shape[-2:]:
+        raise ValueError("background_source must match batch and spatial dimensions")
+    if background_mask.shape != source.shape[:2]:
         raise ValueError("background_mask must have shape (B,N)")
     background_mask = background_mask.to(device=logits.device, dtype=torch.bool)
     has_background = background_mask.any(dim=1)
     if not allow_missing_background and bool((~has_background).any()):
         raise ValueError("every scene requires at least one factual background slot")
-    negative = torch.finfo(logits.dtype).min
+    negative = torch.finfo(source.dtype).min
     background_logits = torch.logsumexp(
-        logits.masked_fill(~background_mask[..., None, None], negative),
+        source.masked_fill(~background_mask[..., None, None], negative),
         dim=1,
         keepdim=True,
     )
@@ -50,7 +55,24 @@ def onefg_support(
             background_logits,
             torch.zeros_like(background_logits),
         )
-    return torch.sigmoid(float(gamma) * (logits - background_logits))
+    return logits - background_logits
+
+
+def onefg_support(
+    mask_logits: torch.Tensor,
+    background_mask: torch.Tensor,
+    *,
+    gamma: float = 2.0,
+    allow_missing_background: bool = False,
+    background_source: torch.Tensor | None = None,
+) -> torch.Tensor:
+    margin = onefg_margin(
+        mask_logits,
+        background_mask,
+        allow_missing_background=allow_missing_background,
+        background_source=background_source,
+    )
+    return torch.sigmoid(float(gamma) * margin)
 
 
 def support_moments(
@@ -311,27 +333,25 @@ def select_transplant_pairs(
     donor_batches = []
     donor_slots = []
     weights = []
+    valid_cpu = valid.detach().cpu()
+    scales_cpu = scales.detach().cpu()
+    source_cpu = source_ids.detach().cpu()
+    slot_lists = [row.nonzero(as_tuple=False).flatten() for row in valid_cpu]
+    source_masks = [valid_cpu & (source_cpu[:, None] != source) for source in source_cpu]
     for recipient_batch in range(valid.shape[0]):
-        candidates = valid[recipient_batch].nonzero(as_tuple=False).flatten()
+        candidates = slot_lists[recipient_batch]
         if candidates.numel() == 0:
             continue
         candidates = candidates[
-            torch.randperm(candidates.numel(), device=valid.device)
+            torch.randperm(candidates.numel(), device=valid.device).cpu()
         ]
         chosen = None
         for recipient_slot in candidates.tolist():
-            recipient_scale = scales[
+            recipient_scale = scales_cpu[
                 recipient_batch, recipient_slot
             ].detach()
-            donor_candidate = (
-                valid
-                & (
-                    source_ids[:, None]
-                    != source_ids[recipient_batch]
-                )
-            )
-            ratio = scales.detach() / recipient_scale.clamp_min(1e-8)
-            donor_candidate &= (
+            ratio = scales_cpu / recipient_scale.clamp_min(1e-8)
+            donor_candidate = source_masks[recipient_batch] & (
                 (ratio >= float(min_scale_ratio))
                 & (ratio <= float(max_scale_ratio))
             )
@@ -369,31 +389,6 @@ def select_transplant_pairs(
     )
 
 
-def build_transplanted_scenes(
-    slots: torch.Tensor,
-    pairs: TransplantPairs,
-    *,
-    appearance_dim: int,
-) -> torch.Tensor:
-
-
-    pairs = pairs.to(slots.device)
-
-
-    scenes = slots[pairs.recipient_batch].detach().clone()
-    if pairs.count:
-        scenes[
-            torch.arange(pairs.count, device=slots.device),
-            pairs.recipient_slot,
-            :appearance_dim,
-        ] = slots[
-            pairs.donor_batch,
-            pairs.donor_slot,
-            :appearance_dim,
-        ]
-    return scenes
-
-
 def geometry_loss(
     *,
     factual_support: torch.Tensor,
@@ -403,6 +398,7 @@ def geometry_loss(
     appearance_dim: int,
     compactness_weight: float = 0.25,
     huber_delta: float = 0.05,
+    center_metric: str = "coordinate_huber",
     epsilon: float = 1e-8,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 
@@ -422,10 +418,12 @@ def geometry_loss(
     donor_support = factual_support[
         pairs.donor_batch, pairs.donor_slot
     ].detach()
-    edited_support = counterfactual_support[
-        torch.arange(pairs.count, device=counterfactual_support.device),
-        pairs.recipient_slot,
-    ]
+    edited_support = counterfactual_support
+    if edited_support.ndim == 4:
+        edited_support = edited_support[
+            torch.arange(pairs.count, device=counterfactual_support.device),
+            pairs.recipient_slot,
+        ]
     recipient_moments = support_moments(recipient_support)
     donor_moments = support_moments(donor_support)
     edited_moments = support_moments(edited_support)
@@ -457,6 +455,13 @@ def geometry_loss(
             per_element = per_element.mean(dim=-1)
         return (per_element * weights).sum() / weights.sum().clamp_min(epsilon)
 
+    if center_metric == "scale_normalized_norm_huber":
+        recipient_scale = factual_slots[
+            pairs.recipient_batch, pairs.recipient_slot, appearance_dim + 2
+        ].detach()
+        center_error = center_error.norm(dim=-1) / (recipient_scale + epsilon)
+    elif center_metric != "coordinate_huber":
+        raise ValueError("unknown center metric")
     center_loss = weighted_huber(center_error)
     radius_loss = weighted_huber(radius_error)
     compactness_loss = weighted_huber(compactness_error)

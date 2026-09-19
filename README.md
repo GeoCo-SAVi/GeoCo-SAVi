@@ -8,7 +8,7 @@ This repository contains the method-defining core used for the Obj3D and MOVi-C 
 - scale-steered convolution and the five-block equivariant renderer;
 - appearance transplantation with recipient-center/radius and
   donor-compactness geometry supervision (`L_geo`);
-- the zero-residual STATM temporal initializer;
+- the STATM temporal initializer with a zero-initialized residual projection;
 - the Obj3D selective-alpha teacher and RGB-target-free selector;
 - factual and counterfactual metric primitives.
 
@@ -23,6 +23,8 @@ eval/     evaluation metric primitives
 ```
 
 ## Data preparation
+
+Model execution requires Linux, Python 3.10 or later, an NVIDIA CUDA GPU, PyTorch 2.5.1 or later, and Triton 3.1 or later. Install the model dependencies with `pip install -r requirements.txt`. Obj3D and MOVi-C use the same CUDA sampling and bilinear-resizing operators.
 
 Install the optional conversion and streaming dependencies with:
 
@@ -73,10 +75,10 @@ The source identifier is used only to prevent appearance-transplant pairs from c
 
 ## Configurations
 
-`config/obj3d.yaml` uses a four-layer CNN that maps 64x64 RGB frames to a 16x16 token grid, six slots, one-frame training, the zero-initialized terminal appearance readout, and the selective-alpha teacher-selector. Its five learned decoder blocks are two scale-steered upsampling blocks followed by three output-resolution refinements. A bounded, zero-initialized RGB-only micro residual restores fine texture without entering the alpha path.
+`config/obj3d.yaml` uses a four-layer CNN that maps 64x64 RGB frames to a 16x16 token grid, six slots, one-frame training, the zero-initialized terminal appearance readout, and the selective-alpha teacher-selector. Its five learned decoder blocks are two scale-steered upsampling blocks followed by three output-resolution refinements. A bounded, zero-initialized RGB-only micro residual contributes to the RGB output without entering the alpha path.
 
 `config/movi_c.yaml` first resizes native RGB bilinearly to 64x64, then bicubically to 336x336 for frozen DINOv2 block-12 features projected from 384 to 128 dimensions. It uses eleven slots, two-frame clips through 70k, and
-four-frame clips afterward. Its five learned decoder blocks are one 32x32 canonical refinement, one 32-to-64 upsampling block, and three 64x64 refinements. Selective alpha ownership is disabled for MOVi-C. The terminal appearance readout and RGB micro residual are also disabled in the reported MOVi-C configuration.
+four-frame clips afterward. Its five learned decoder blocks are one 32x32 refinement, one 32-to-64 upsampling block, and three 64x64 refinements. Selective alpha ownership is disabled for MOVi-C. The terminal appearance readout and RGB micro residual are also disabled in the reported MOVi-C configuration.
 
 The renderer reference-scale continuation is a global numerical conditioning schedule. It neither replaces nor supervises the per-slot scale.
 
@@ -113,4 +115,4 @@ Checkpoints retain the training state needed to resume the continuous curriculum
 
 Obj3D uses target RGB only to create detached, tri-state training labels: trusted transfer, protected object evidence, or unknown. The deployed selector never receives target RGB. It predicts whether to apply a bounded symmetric logit correction that subtracts `delta` from the current owner and adds the same `delta` to background; every unselected pixel is exactly unchanged.
 
-MOVi-C uses neither this teacher nor this selector. Multiple factual background slots are instead aggregated by log-sum-exp in the gamma-2 OneFG geometry proxy. Formal segmentation always uses the full-softmax slot argmax.
+MOVi-C uses neither this teacher nor this selector. Multiple factual background slots are aggregated by log-sum-exp in the gamma-2 OneFG geometry proxy. Formal segmentation always uses the full-softmax slot argmax.

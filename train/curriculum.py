@@ -30,6 +30,8 @@ class CurriculumState:
     selector_train: bool
     selector_apply: bool
     selector_max_delta: float
+    center_metric: str = "coordinate_huber"
+    tail_weight: float = 0.0
 
 
 class GeoCoCurriculum:
@@ -144,4 +146,15 @@ class GeoCoCurriculum:
             ),
             selector_apply=selector_apply,
             selector_max_delta=selector_max_delta,
+            center_metric=(
+                "scale_normalized_norm_huber"
+                if self.schedule.get("center_normalize_start_step") is not None
+                and step >= int(self.schedule["center_normalize_start_step"])
+                else "coordinate_huber"
+            ),
+            tail_weight=(
+                float(self.loss.get("tail_weight", 0.0))
+                if step >= int(self.schedule.get("tail_start_step", self.max_steps + 1))
+                else 0.0
+            ),
         )

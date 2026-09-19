@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .steered_conv import ScaleSteeredConv2d, ScaleSteeredConvBlock
+from .steered_conv import ScaleSteeredConv2d, ScaleSteeredConvBlock, upsample
 
 
 def _coordinate_grid(size: int, device, dtype) -> torch.Tensor:
@@ -275,8 +275,6 @@ class ScaleSteeredDecoder(nn.Module):
         if slots.ndim != 3 or slots.shape[-1] != self.appearance_dim + 3:
             raise ValueError("slots must have shape (B,N,appearance_dim+3)")
         batch, num_slots, _ = slots.shape
-        if num_slots != self.num_slots:
-            raise ValueError("slot count does not match the decoder")
         appearance = slots[..., : self.appearance_dim]
         position = slots[..., self.appearance_dim : self.appearance_dim + 2]
         scale = slots[..., -1:]
@@ -299,18 +297,13 @@ class ScaleSteeredDecoder(nn.Module):
         if self.canonical_block is not None:
             features = self.canonical_block(features, merged_scale)
         for block in self.upsample_blocks:
-            features = F.interpolate(
-                features,
-                scale_factor=2.0,
-                mode="bilinear",
-                align_corners=True,
-            )
+            features = upsample(features.float().contiguous(memory_format=torch.channels_last))
             features = block(features, merged_scale)
         for block in self.output_blocks:
             features = block(features, merged_scale)
         if features.shape[-2:] != (self.image_size, self.image_size):
             raise RuntimeError("decoder topology did not reach the output canvas")
-        return features, merged_scale, batch, num_slots
+        return features.float(), merged_scale, batch, num_slots
 
     def _selector_fields(
         self,
@@ -454,6 +447,12 @@ class ScaleSteeredDecoder(nn.Module):
             "delta_required": delta_required[:, None],
         }
 
+    def forward_alpha_logits(self, slots: torch.Tensor) -> torch.Tensor:
+        features, scales, batch, num_slots = self._spatial_trunk(slots)
+        return self.alpha_head(features, scales).reshape(
+            batch, num_slots, 1, self.image_size, self.image_size
+        )
+
     def forward(
         self,
         slots: torch.Tensor,
@@ -461,6 +460,8 @@ class ScaleSteeredDecoder(nn.Module):
         attention: torch.Tensor | None = None,
         use_selector: bool = True,
     ) -> DecoderOutput:
+        if slots.shape[1] != self.num_slots:
+            raise ValueError("slot count does not match the decoder")
         features, scales, batch, num_slots = self._spatial_trunk(slots)
         appearance = slots[..., : self.appearance_dim]
         style = self.rgb_style(appearance).reshape(
@@ -517,7 +518,7 @@ class ScaleSteeredDecoder(nn.Module):
                 self._selector_max_delta,
             )
             delta = delta * selected.float() * self._selector_apply
-            correction = torch.zeros_like(base_logits[:, :, 0])
+            correction = torch.zeros_like(base_logits[:, :, 0], dtype=delta.dtype)
             correction.scatter_add_(
                 1, selector_fields["owner"], -delta
             )

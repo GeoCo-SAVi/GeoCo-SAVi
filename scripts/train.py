@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch._functorch.config
+import torch._inductor.config
 import yaml
 
 
@@ -74,6 +76,8 @@ def main() -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     model = GeoCoSAVi.from_config(config)
     print(json.dumps(parameter_summary(model), sort_keys=True))
@@ -85,7 +89,13 @@ def main() -> None:
         bool(config["training"].get("compile_decoder", False))
         and not arguments.disable_compile
     ):
-        model.decoder = torch.compile(model.decoder)
+        if hasattr(torch._functorch.config, "donated_buffer"):
+            torch._functorch.config.donated_buffer = False
+        torch._inductor.config.triton.cudagraph_trees = False
+        model.decoder = torch.compile(model.decoder, mode="reduce-overhead")
+        model.decoder.forward_alpha_logits = torch.compile(
+            model.decoder.forward_alpha_logits, mode="reduce-overhead"
+        )
 
     trainer = GeoCoTrainer(model, config)
     start_step = 0

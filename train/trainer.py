@@ -11,10 +11,10 @@ from models.geoco_savi import GeoCoSAVi, VideoOutput
 
 from .curriculum import CurriculumState, GeoCoCurriculum
 from .geometry import (
-    build_transplanted_scenes,
     factual_slot_quality,
     geometry_coherence_filter,
     geometry_loss,
+    onefg_margin,
     onefg_support,
     select_transplant_pairs,
 )
@@ -22,6 +22,7 @@ from .losses import (
     normalized_attention_overlap,
     position_alignment_loss,
     reconstruction_loss,
+    tail_penalty,
 )
 from .selector import (
     SelectorTeacherConfig,
@@ -118,6 +119,8 @@ class GeoCoTrainer:
             if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
+        if self.device.type != "cuda":
+            raise ValueError("model training requires a CUDA device")
         self.model.to(self.device)
         training = config["training"]
         self.base_lr = float(training["learning_rate"])
@@ -275,27 +278,17 @@ class GeoCoTrainer:
     def _position_objective(
         self,
         output: VideoOutput,
+        *,
+        include_tail: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        slots, alpha, _, attention = self._flatten_video(output)
+        slots, alpha, logits, attention = self._flatten_video(output)
         quality = self._quality(slots, alpha, attention)
         appearance_dim = self.model.slot_attention.appearance_dim
 
 
-        routed_slots = torch.cat(
-            [
-                slots[..., :appearance_dim],
-                slots[..., appearance_dim:].detach(),
-            ],
-            dim=-1,
-        )
-        decoded = self.model.decoder(
-            routed_slots,
-            attention=attention,
-            use_selector=True,
-        )
         loss, metrics = position_alignment_loss(
-            slots=routed_slots,
-            mask_logits=decoded.mask_logits,
+            slots=slots,
+            mask_logits=logits,
             background_mask=quality["background"],
             valid=quality["foreground"],
             appearance_dim=appearance_dim,
@@ -305,12 +298,27 @@ class GeoCoTrainer:
             onefg_gamma=float(self.config["loss"]["onefg_gamma"]),
             huber_delta=float(self.config["loss"]["huber_delta"]),
         )
+        if include_tail:
+            margin = onefg_margin(
+                logits.float(),
+                quality["background"],
+                allow_missing_background=True,
+            )
+            metrics["tail"] = tail_penalty(
+                margin,
+                quality["foreground"] & quality["background"].any(dim=1, keepdim=True),
+                threshold=float(self.config["loss"].get("tail_threshold", 0.25)),
+                gamma=float(self.config["loss"]["onefg_gamma"]),
+            )
         return loss, metrics
 
     def _geometry_objective(
         self,
         output: VideoOutput,
         source_ids: torch.Tensor,
+        *,
+        center_metric: str = "coordinate_huber",
+        include_tail: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         batch, frame_count, num_slots, slot_dim = output.slots.shape
         indices = [
@@ -381,27 +389,27 @@ class GeoCoTrainer:
                 "geometry_radius": zero.detach(),
                 "geometry_compactness": zero.detach(),
                 "geometry_pairs": zero.detach(),
+                "tail": zero,
             }
-        transplanted = build_transplanted_scenes(
-            slots,
-            pairs,
-            appearance_dim=self.model.slot_attention.appearance_dim,
-        )
-
-
-        counterfactual = self.model.decoder(
-            transplanted,
-            use_selector=False,
-        )
+        appearance_dim = self.model.slot_attention.appearance_dim
+        target_slots = torch.cat(
+            [
+                slots[pairs.donor_batch, pairs.donor_slot, :appearance_dim],
+                slots[pairs.recipient_batch, pairs.recipient_slot, appearance_dim:].detach(),
+            ],
+            dim=-1,
+        ).unsqueeze(1)
+        target_logits = self.model.decoder.forward_alpha_logits(target_slots)
         counterfactual_support = onefg_support(
-            counterfactual.mask_logits,
+            target_logits,
             quality["background"][pairs.recipient_batch],
             gamma=float(self.config["loss"]["onefg_gamma"]),
             allow_missing_background=True,
+            background_source=logits[pairs.recipient_batch],
         )
         loss, parts = geometry_loss(
             factual_support=factual_support,
-            counterfactual_support=counterfactual_support,
+            counterfactual_support=counterfactual_support[:, 0],
             factual_slots=slots,
             pairs=pairs,
             appearance_dim=self.model.slot_attention.appearance_dim,
@@ -409,12 +417,29 @@ class GeoCoTrainer:
                 self.config["loss"]["compactness_weight"]
             ),
             huber_delta=float(self.config["loss"]["huber_delta"]),
+            center_metric=center_metric,
         )
+        tail = loss * 0.0
+        if include_tail:
+            margin = onefg_margin(
+                target_logits.float(),
+                quality["background"][pairs.recipient_batch],
+                allow_missing_background=True,
+                background_source=logits[pairs.recipient_batch].float(),
+            )
+            target_margin = margin[:, 0]
+            tail = tail_penalty(
+                target_margin,
+                pairs.weight,
+                threshold=float(self.config["loss"].get("tail_threshold", 0.25)),
+                gamma=float(self.config["loss"]["onefg_gamma"]),
+            )
         return loss, {
             "geometry_center": parts["center"],
             "geometry_radius": parts["radius"],
             "geometry_compactness": parts["compactness"],
             "geometry_pairs": parts["pairs"],
+            "tail": tail,
         }
 
     def _selector_objective(
@@ -507,14 +532,19 @@ class GeoCoTrainer:
             )
             overlap = normalized_attention_overlap(attention)
             zero = reconstruction * 0.0
-            if state.position_weight > 0.0:
-                position, position_metrics = self._position_objective(output)
+            if state.position_weight > 0.0 or state.tail_weight > 0.0:
+                position, position_metrics = self._position_objective(
+                    output, include_tail=state.tail_weight > 0.0
+                )
             else:
                 position = zero
                 position_metrics = {"valid": zero.detach()}
-            if state.geometry_weight > 0.0:
+            factual_tail = position_metrics.pop("tail", zero)
+            if state.geometry_weight > 0.0 or state.tail_weight > 0.0:
                 geometry, geometry_metrics = self._geometry_objective(
-                    output, source_ids
+                    output, source_ids,
+                    center_metric=state.center_metric,
+                    include_tail=state.tail_weight > 0.0,
                 )
             else:
                 geometry = zero
@@ -524,20 +554,27 @@ class GeoCoTrainer:
                     "geometry_compactness": zero.detach(),
                     "geometry_pairs": zero.detach(),
                 }
+            counterfactual_tail = geometry_metrics.pop("tail", zero)
+            tail = 0.5 * (factual_tail + counterfactual_tail)
             terminal_gate = self.model.slot_attention.terminal_gate
             gate_regularization = (
                 terminal_gate.square().mean()
                 if terminal_gate is not None
                 else zero
             )
-            core_loss = (
+            routed_loss = (
+                state.position_weight * position
+                + 0.5 * state.tail_weight * factual_tail
+            )
+            base_loss = (
                 state.reconstruction_weight * reconstruction
                 + state.overlap_weight * overlap
-                + state.position_weight * position
                 + state.geometry_weight * geometry
+                + 0.5 * state.tail_weight * counterfactual_tail
                 + float(self.config["loss"]["terminal_gate_weight"])
                 * gate_regularization
             )
+            core_loss = base_loss + routed_loss
             selector_loss = None
             selector_metrics: dict[str, torch.Tensor] = {}
             if state.selector_train:
@@ -545,7 +582,23 @@ class GeoCoTrainer:
                     output, video
                 )
 
-        self.scaler.scale(core_loss).backward()
+        has_routed_loss = state.position_weight > 0.0 or state.tail_weight > 0.0
+        self.scaler.scale(base_loss).backward(retain_graph=has_routed_loss)
+        if has_routed_loss:
+            appearance_dim = self.model.slot_attention.appearance_dim
+
+            def block_commands(gradient):
+                return torch.cat(
+                    [gradient[..., :appearance_dim], torch.zeros_like(gradient[..., appearance_dim:])],
+                    dim=-1,
+                )
+
+            hooks = [slots.register_hook(block_commands) for slots in output.decoder_slots]
+            try:
+                self.scaler.scale(routed_loss).backward()
+            finally:
+                for hook in hooks:
+                    hook.remove()
         if selector_loss is not None:
             self.scaler.scale(selector_loss).backward()
         self.scaler.unscale_(self.core_optimizer)
@@ -569,6 +622,9 @@ class GeoCoTrainer:
             "overlap": overlap.detach(),
             "position": position.detach(),
             "geometry": geometry.detach(),
+            "tail": tail.detach(),
+            "tail_factual": factual_tail.detach(),
+            "tail_counterfactual": counterfactual_tail.detach(),
             "terminal_gate": gate_regularization.detach(),
             "position_valid": position_metrics["valid"],
             **geometry_metrics,

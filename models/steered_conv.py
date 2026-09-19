@@ -5,6 +5,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton as tr
+import triton.language as tl
 
 
 def _odd_kernel(value: int) -> int:
@@ -36,6 +38,8 @@ class ScaleSteeredConv2d(nn.Module):
         self.s_ref = float(s_ref)
         self.gain_max = float(gain_max)
         self.padding_mode = str(padding_mode)
+        if self.padding_mode != "zeros":
+            raise ValueError("padding_mode must be zeros")
         if self.s_ref <= 0.0:
             raise ValueError("s_ref must be positive")
         if self.gain_max <= 1.0:
@@ -112,45 +116,25 @@ class ScaleSteeredConv2d(nn.Module):
         dilation = (
             scales / self._effective_s_ref.to(device=x.device)
         ) * self.gain.float()
-        coordinate_dtype = torch.float32
-        yy, xx = torch.meshgrid(
-            torch.linspace(-1.0, 1.0, height, device=x.device, dtype=coordinate_dtype),
-            torch.linspace(-1.0, 1.0, width, device=x.device, dtype=coordinate_dtype),
-            indexing="ij",
-        )
-        base_grid = torch.stack([xx, yy], dim=-1).view(1, 1, height, width, 2)
-        pixel_spacing = torch.tensor(
-            [
-                2.0 / max(width - 1, 1),
-                2.0 / max(height - 1, 1),
-            ],
-            device=x.device,
-            dtype=coordinate_dtype,
-        )
-        offsets = self.kernel_offsets_xy.to(x.device) * pixel_spacing
-        sample_grid = base_grid + (
-            dilation.view(batch, 1, 1, 1, 1)
-            * offsets.view(1, -1, 1, 1, 2)
-        )
+        if self.kernel_size == 1:
+            return F.conv2d(x, self.weight, self.bias)
 
-        taps = self.kernel_size * self.kernel_size
-        sample_input = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
-        sampled = F.grid_sample(
-            sample_input[:, None]
-            .expand(-1, taps, -1, -1, -1)
-            .reshape(batch * taps, self.in_channels, height, width),
-            sample_grid.reshape(batch * taps, height, width, 2),
-            mode="bilinear",
-            padding_mode=self.padding_mode,
-            align_corners=True,
-        ).reshape(batch, taps, self.in_channels, height, width)
-
-        weight = self.weight.float().reshape(
-            self.out_channels, self.in_channels, taps
+        low = torch.is_autocast_enabled("cuda") and (
+            torch.get_autocast_dtype("cuda") == torch.bfloat16
         )
-        output = torch.einsum("bkihw,oik->bohw", sampled, weight)
-        if self.bias is not None:
-            output = output + self.bias.float().view(1, -1, 1, 1)
+        sampled = sample(
+            x.contiguous(memory_format=torch.channels_last),
+            dilation.contiguous(),
+            self.kernel_size,
+            low,
+        )
+        weight = self.weight.permute(0, 2, 3, 1).reshape(self.out_channels, -1)
+        if self.kernel_size == 3 and self.out_channels == 64:
+            flat = sampled.permute(0, 2, 3, 1).reshape(batch * height * width, -1)
+            output = F.linear(flat, weight, self.bias)
+            output = output.reshape(batch, height, width, self.out_channels).permute(0, 3, 1, 2)
+        else:
+            output = F.conv2d(sampled, weight[:, :, None, None], self.bias)
         return output.to(dtype=x.dtype)
 
 
@@ -170,3 +154,333 @@ class ScaleSteeredConvBlock(nn.Module):
     def forward(self, x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         return self.activation(self.conv(x, scales))
 
+
+@tr.jit
+def forward_kernel(
+    X,
+    D,
+    Y,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    K: tl.constexpr,
+    B: tl.constexpr,
+    SWAP: tl.constexpr = False,
+):
+    n = tl.program_id(1 if SWAP else 0)
+    i = tl.program_id(0 if SWAP else 1) * B + tl.arange(0, B)
+    m = i < H * W * C * K * K
+    c = i % C
+    p = (i // C) % (K * K)
+    pix = i // (C * K * K)
+    dilation = tl.load(D + n)
+    sx = dilation * (p % K - K // 2)
+    sy = dilation * (p // K - K // 2)
+    fx = tl.floor(sx).to(tl.int32)
+    fy = tl.floor(sy).to(tl.int32)
+    wx = sx - fx
+    wy = sy - fy
+    xx = pix % W + fx
+    yy = pix // W + fy
+    base = n * H * W * C + c
+    a = tl.load(
+        X + base + (yy * W + xx) * C,
+        m & (xx >= 0) & (xx < W) & (yy >= 0) & (yy < H),
+        other=0,
+    ).to(tl.float32)
+    b = tl.load(
+        X + base + (yy * W + xx + 1) * C,
+        m & (xx + 1 >= 0) & (xx + 1 < W) & (yy >= 0) & (yy < H),
+        other=0,
+    ).to(tl.float32)
+    d = tl.load(
+        X + base + ((yy + 1) * W + xx) * C,
+        m & (xx >= 0) & (xx < W) & (yy + 1 >= 0) & (yy + 1 < H),
+        other=0,
+    ).to(tl.float32)
+    e = tl.load(
+        X + base + ((yy + 1) * W + xx + 1) * C,
+        m & (xx + 1 >= 0) & (xx + 1 < W) & (yy + 1 >= 0) & (yy + 1 < H),
+        other=0,
+    ).to(tl.float32)
+    tl.store(
+        Y + n * H * W * C * K * K + i,
+        a * (1 - wx) * (1 - wy) + b * wx * (1 - wy) + d * (1 - wx) * wy + e * wx * wy,
+        m,
+    )
+
+
+@tr.jit
+def backward_kernel(
+    X,
+    D,
+    DY,
+    DX,
+    PART,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    K: tl.constexpr,
+    B: tl.constexpr,
+    TILES: tl.constexpr,
+    SWAP: tl.constexpr = False,
+):
+    n = tl.program_id(1 if SWAP else 0)
+    tile = tl.program_id(0 if SWAP else 1)
+    i = tile * B + tl.arange(0, B)
+    m = i < H * W * C
+    c = i % C
+    pix = i // C
+    dilation = tl.load(D + n)
+    result = tl.full((B,), 0, tl.float32)
+    rd = tl.full((B,), 0, tl.float32)
+    for p in range(K * K):
+        ox = p % K - K // 2
+        oy = p // K - K // 2
+        sx = dilation * ox
+        sy = dilation * oy
+        fx = tl.floor(sx).to(tl.int32)
+        fy = tl.floor(sy).to(tl.int32)
+        wx = sx - fx
+        wy = sy - fy
+        xx = pix % W - fx
+        yy = pix // W - fy
+        base = n * H * W * C * K * K + p * C + c
+        a = tl.load(
+            DY + base + (yy * W + xx) * C * K * K,
+            m & (xx >= 0) & (xx < W) & (yy >= 0) & (yy < H),
+            other=0,
+        ).to(tl.float32)
+        b = tl.load(
+            DY + base + (yy * W + xx - 1) * C * K * K,
+            m & (xx - 1 >= 0) & (xx - 1 < W) & (yy >= 0) & (yy < H),
+            other=0,
+        ).to(tl.float32)
+        d = tl.load(
+            DY + base + ((yy - 1) * W + xx) * C * K * K,
+            m & (xx >= 0) & (xx < W) & (yy - 1 >= 0) & (yy - 1 < H),
+            other=0,
+        ).to(tl.float32)
+        e = tl.load(
+            DY + base + ((yy - 1) * W + xx - 1) * C * K * K,
+            m & (xx - 1 >= 0) & (xx - 1 < W) & (yy - 1 >= 0) & (yy - 1 < H),
+            other=0,
+        ).to(tl.float32)
+        result += (
+            a * (1 - wx) * (1 - wy)
+            + b * wx * (1 - wy)
+            + d * (1 - wx) * wy
+            + e * wx * wy
+        )
+        g = tl.load(DY + base + pix * C * K * K, m, other=0).to(tl.float32)
+        xx = pix % W + fx
+        yy = pix // W + fy
+        base = n * H * W * C + c
+        a = tl.load(
+            X + base + (yy * W + xx) * C,
+            m & (xx >= 0) & (xx < W) & (yy >= 0) & (yy < H),
+            other=0,
+        ).to(tl.float32)
+        b = tl.load(
+            X + base + (yy * W + xx + 1) * C,
+            m & (xx + 1 >= 0) & (xx + 1 < W) & (yy >= 0) & (yy < H),
+            other=0,
+        ).to(tl.float32)
+        d = tl.load(
+            X + base + ((yy + 1) * W + xx) * C,
+            m & (xx >= 0) & (xx < W) & (yy + 1 >= 0) & (yy + 1 < H),
+            other=0,
+        ).to(tl.float32)
+        e = tl.load(
+            X + base + ((yy + 1) * W + xx + 1) * C,
+            m & (xx + 1 >= 0) & (xx + 1 < W) & (yy + 1 >= 0) & (yy + 1 < H),
+            other=0,
+        ).to(tl.float32)
+        rd += g * (
+            ox * ((b - a) * (1 - wy) + (e - d) * wy)
+            + oy * ((d - a) * (1 - wx) + (e - b) * wx)
+        )
+    tl.store(DX + n * H * W * C + i, result, m)
+    tl.store(PART + n * TILES + tile, tl.sum(rd, 0))
+
+
+@torch.library.custom_op("geoco_spatial::sample", mutates_args=())
+def sample(x: torch.Tensor, d: torch.Tensor, k: int, low: bool) -> torch.Tensor:
+    if x.device.type != "cuda":
+        raise ValueError("spatial sampling requires a CUDA tensor")
+    n, c, h, w = x.shape
+    y = torch.empty(
+        (n, c * k * k, h, w),
+        device=x.device,
+        dtype=torch.bfloat16 if low else x.dtype,
+        memory_format=torch.channels_last,
+    )
+    block = 1024
+    swap = True
+    tiles = tr.cdiv(c * h * w * k * k, block)
+    forward_kernel[(tiles, n) if swap else (n, tiles)](
+        x, d, y, c, h, w, k, block, SWAP=swap, enable_fp_fusion=False
+    )
+    return y
+
+
+@sample.register_fake
+def fake(x, d, k, low):
+    n, c, h, w = x.shape
+    return torch.empty(
+        (n, c * k * k, h, w),
+        device=x.device,
+        dtype=torch.bfloat16 if low else x.dtype,
+        memory_format=torch.channels_last,
+    )
+
+
+@torch.library.custom_op("geoco_spatial::backward", mutates_args=())
+def backward_op(
+    x: torch.Tensor, d: torch.Tensor, dy: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n, c, h, w = x.shape
+    dy = dy.contiguous(memory_format=torch.channels_last)
+    block = 1024
+    dx = torch.empty_like(x, memory_format=torch.channels_last)
+    tiles = tr.cdiv(c * h * w, block)
+    part = torch.empty((n, tiles), device=x.device, dtype=torch.float32)
+    swap = True
+    backward_kernel[(tiles, n) if swap else (n, tiles)](
+        x,
+        d,
+        dy,
+        dx,
+        part,
+        c,
+        h,
+        w,
+        k,
+        block,
+        tiles,
+        SWAP=swap,
+        enable_fp_fusion=False,
+        num_warps=4,
+    )
+    return dx, part.sum(1).reshape_as(d)
+
+
+@backward_op.register_fake
+def fake_bwd(x, d, dy, k):
+    return torch.empty_like(x, memory_format=torch.channels_last), torch.empty_like(d)
+
+
+def setup(ctx, inputs, output):
+    x, d, k, low = inputs
+    ctx.save_for_backward(x, d)
+    ctx.k = k
+
+
+def backward(ctx, dy):
+    return (*backward_op(*ctx.saved_tensors, dy, ctx.k), None, None)
+
+
+sample.register_autograd(backward, setup_context=setup)
+
+
+@tr.jit
+def gather_backward(
+    DY, DX, C: tl.constexpr, H: tl.constexpr, W: tl.constexpr, B: tl.constexpr
+):
+    n = tl.program_id(1)
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    m = i < C * H * W
+    c = i % C
+    ix = (i // C) % W
+    iy = i // (C * W)
+    OH: tl.constexpr = H * 2
+    OW: tl.constexpr = W * 2
+    sx: tl.constexpr = (W - 1) / (OW - 1)
+    sy: tl.constexpr = (H - 1) / (OH - 1)
+    startx = tl.maximum(0, tl.ceil((ix - 1) / sx).to(tl.int32))
+    starty = tl.maximum(0, tl.ceil((iy - 1) / sy).to(tl.int32))
+    value = tl.full((B,), 0, tl.float32)
+    for ky in range(5):
+        oy = starty + ky
+        ry = oy * sy
+        fy = tl.floor(ry).to(tl.int32)
+        ly = ry - fy
+        wy = tl.where(iy == fy, 1 - ly, tl.where(iy == fy + 1, ly, 0))
+        for kx in range(5):
+            ox = startx + kx
+            rx = ox * sx
+            fx = tl.floor(rx).to(tl.int32)
+            lx = rx - fx
+            wx = tl.where(ix == fx, 1 - lx, tl.where(ix == fx + 1, lx, 0))
+            v = tl.load(
+                DY + ((n * OH + oy) * OW + ox) * C + c,
+                m
+                & (oy >= 0)
+                & (oy < OH)
+                & (ox >= 0)
+                & (ox < OW)
+                & (wy != 0)
+                & (wx != 0),
+                other=0,
+            ).to(tl.float32)
+            value += v * wy * wx
+    tl.store(DX + n * C * H * W + i, value, m)
+
+
+@torch.library.custom_op("geoco_resize::forward", mutates_args=())
+def upsample(x: torch.Tensor) -> torch.Tensor:
+    if x.device.type != "cuda" or min(x.shape[-2:]) < 2:
+        raise ValueError(
+            "bilinear resizing requires a CUDA tensor with spatial dimensions at least two"
+        )
+    return torch.nn.functional.interpolate(
+        x, scale_factor=2.0, mode="bilinear", align_corners=True
+    )
+
+
+@upsample.register_fake
+def upsample_fake(x):
+    n, c, h, w = x.shape
+    return torch.empty(
+        (n, c, h * 2, w * 2),
+        device=x.device,
+        dtype=x.dtype,
+        memory_format=torch.channels_last,
+    )
+
+
+@torch.library.custom_op("geoco_resize::backward", mutates_args=())
+def upsample_backward_op(dy: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    n, c, oh, ow = dy.shape
+    dy = dy.contiguous(memory_format=torch.channels_last)
+    dx = torch.empty(
+        (n, c, h, w),
+        device=dy.device,
+        dtype=dy.dtype,
+        memory_format=torch.channels_last,
+    )
+    gather_backward[(tr.cdiv(c * h * w, 512), n)](
+        dy, dx, c, h, w, 512, enable_fp_fusion=False
+    )
+    return dx
+
+
+@upsample_backward_op.register_fake
+def fake_back(dy, h, w):
+    return torch.empty(
+        (dy.shape[0], dy.shape[1], h, w),
+        device=dy.device,
+        dtype=dy.dtype,
+        memory_format=torch.channels_last,
+    )
+
+
+def upsample_setup(ctx, inputs, output):
+    ctx.hw = inputs[0].shape[-2:]
+
+
+def upsample_backward(ctx, dy):
+    return upsample_backward_op(dy, *ctx.hw)
+
+
+upsample.register_autograd(upsample_backward, setup_context=upsample_setup)

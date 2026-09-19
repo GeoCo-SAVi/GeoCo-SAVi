@@ -27,6 +27,7 @@ class VideoOutput:
     attention: torch.Tensor
     ownership: torch.Tensor
     frames: tuple[DecoderOutput, ...]
+    decoder_slots: tuple[torch.Tensor, ...] = ()
 
 
 class GeoCoSAVi(nn.Module):
@@ -162,6 +163,7 @@ class GeoCoSAVi(nn.Module):
         if video.ndim != 5:
             raise ValueError("video must have shape (B,T,C,H,W)")
         outputs: list[DecoderOutput] = []
+        decoder_slots = []
         slots_by_time: list[torch.Tensor] = []
         attentions: list[torch.Tensor] = []
         ownerships: list[torch.Tensor] = []
@@ -189,14 +191,16 @@ class GeoCoSAVi(nn.Module):
                     else self.iterations_rest
                 ),
             )
+            rendering_slots = slot_output.slots.clone()
             decoded = self.decoder(
-                slot_output.slots,
+                rendering_slots,
                 attention=slot_output.attention,
             )
             slots_by_time.append(slot_output.slots)
             attentions.append(slot_output.attention)
             ownerships.append(slot_output.ownership)
             outputs.append(decoded)
+            decoder_slots.append(rendering_slots)
 
         return VideoOutput(
             reconstruction=torch.stack(
@@ -222,4 +226,5 @@ class GeoCoSAVi(nn.Module):
             attention=torch.stack(attentions, dim=1),
             ownership=torch.stack(ownerships, dim=1),
             frames=tuple(outputs),
+            decoder_slots=tuple(decoder_slots),
         )

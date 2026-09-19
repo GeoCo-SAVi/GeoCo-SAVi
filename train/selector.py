@@ -267,36 +267,27 @@ def _tail_ranking(
     if temperature <= 0.0:
         raise ValueError("rank_temperature must be positive")
     owner = owner_index[:, 0].long()
-    losses = []
-    for scene in range(logits.shape[0]):
-        for slot in torch.unique(owner[scene]).tolist():
-            stratum = owner[scene] == int(slot)
-            positive = positive_weight[scene][stratum]
-            protected = protected_weight[scene][stratum]
-            values = logits[scene][stratum]
-            has_positive = positive > 0.0
-            has_protected = protected > 0.0
-            if not bool(has_positive.any()) or not bool(has_protected.any()):
-                continue
-            p = positive[has_positive].clamp_min(1e-8)
-            n = protected[has_protected].clamp_min(1e-8)
-            z_p = values[has_positive]
-            z_n = values[has_protected]
-            soft_min = -temperature * (
-                torch.logsumexp(p.log() - z_p / temperature, dim=0)
-                - torch.logsumexp(p.log(), dim=0)
-            )
-            soft_max = temperature * (
-                torch.logsumexp(n.log() + z_n / temperature, dim=0)
-                - torch.logsumexp(n.log(), dim=0)
-            )
-            losses.append(
-                F.softplus((margin + soft_max - soft_min) / temperature)
-                * temperature
-            )
-    if not losses:
-        return logits.sum() * 0.0
-    return torch.stack(losses).mean()
+    count = int(owner.max().item()) + 1
+    mask = owner[:, None] == torch.arange(count, device=owner.device)[None, :, None, None]
+    values = logits[:, None].flatten(2)
+
+    def tail(weight, sign):
+        weights = weight[:, None].expand_as(mask).flatten(2)
+        valid = mask.flatten(2) & (weights > 0)
+        present = valid.any(-1)
+        logs = torch.where(valid, weights.clamp_min(1e-8).log(), -torch.inf)
+        logs = torch.where(present[..., None], logs, torch.zeros_like(logs))
+        return (
+            torch.logsumexp(logs + sign * values / temperature, -1)
+            - torch.logsumexp(logs, -1),
+            present,
+        )
+
+    positive, has_positive = tail(positive_weight, -1)
+    protected, has_protected = tail(protected_weight, 1)
+    present = has_positive & has_protected
+    losses = F.softplus(margin / temperature + protected + positive) * temperature
+    return torch.where(present, losses, 0).sum() / present.sum().clamp_min(1)
 
 
 def selector_training_loss(

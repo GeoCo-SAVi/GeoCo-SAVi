@@ -4,7 +4,7 @@ GeoCo-SAVi is a geometry-consistent slot-attention model with an explicit appear
 
 This repository contains the method-defining core used for the Obj3D and MOVi-C protocols:
 
-- invariant Slot Attention with iid random position initialization;
+- isotropic invariant Slot Attention with iid random position initialization;
 - scale-steered convolution and the five-block equivariant renderer;
 - appearance transplantation with recipient-center/radius and
   donor-compactness geometry supervision (`L_geo`);

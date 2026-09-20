@@ -226,11 +226,7 @@ def binary_f_score(
     denominator = (
         prediction.sum(dim=(-2, -1)) + target.sum(dim=(-2, -1))
     ).float()
-    score = torch.where(
-        denominator > 0,
-        2.0 * intersection / denominator.clamp_min(1.0),
-        torch.zeros_like(denominator),
-    )
+    score = 2.0 * intersection / denominator
     return score.mean()
 
 
@@ -249,11 +245,7 @@ def tube_f_score(
         prediction.sum(dim=(-3, -2, -1))
         + target.sum(dim=(-3, -2, -1))
     ).float()
-    score = torch.where(
-        denominator > 0,
-        2.0 * intersection / denominator.clamp_min(1.0),
-        torch.zeros_like(denominator),
-    )
+    score = 2.0 * intersection / denominator
     return score.mean()
 
 
@@ -292,10 +284,9 @@ def hard_mask_geometry(
         (masks * distance).sum(dim=(-2, -1)) / mass.clamp_min(epsilon)
     )
     coverage = mass / float(height * width)
-    nan = torch.full_like(radius, float("nan"))
     return {
         "centroid": torch.where(valid[..., None], centroid, float("nan")),
-        "radius": torch.where(valid, radius, nan),
+        "radius": radius,
         "coverage": coverage,
         "mass": mass,
         "valid": valid,
@@ -542,3 +533,61 @@ def coverage_slope(
     scale_factors: Iterable[float] | torch.Tensor,
 ) -> torch.Tensor:
     return scale_sweep_metrics(masks, scale_factors)["coverage_slope"]
+
+
+def _scale_radius_inputs(
+    scale: torch.Tensor,
+    radius: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = torch.as_tensor(scale).to(dtype=torch.float64)
+    radius = torch.as_tensor(radius, device=scale.device).to(dtype=torch.float64)
+    if scale.shape != radius.shape or scale.numel() == 0:
+        raise ValueError("scale and radius must share a nonempty shape")
+    if not bool(torch.isfinite(scale).all() & torch.isfinite(radius).all()):
+        raise ValueError("scale and radius must be finite")
+    return scale.reshape(-1), radius.reshape(-1)
+
+
+def scale_radius_linear_r2(
+    scale: torch.Tensor,
+    radius: torch.Tensor,
+) -> torch.Tensor:
+    scale, radius = _scale_radius_inputs(scale, radius)
+    x = scale - scale.mean()
+    y = radius - radius.mean()
+    variance = x.square().sum()
+    slope = (x * y).sum() / torch.where(
+        variance > 0, variance, torch.ones_like(variance)
+    )
+    return 1.0 - (y - slope * x).square().sum() / y.square().sum()
+
+
+def _log_radius_scale_ratio(
+    scale: torch.Tensor,
+    radius: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scale, radius = _scale_radius_inputs(scale, radius)
+    if bool((scale <= 0).any() | (radius <= 0).any()):
+        raise ValueError("scale and radius must be positive for logarithms")
+    log_radius = radius.log()
+    return log_radius, log_radius - scale.log()
+
+
+def scale_radius_fixed_log_r2(
+    scale: torch.Tensor,
+    radius: torch.Tensor,
+) -> torch.Tensor:
+    log_radius, log_ratio = _log_radius_scale_ratio(scale, radius)
+    residual = log_ratio - log_ratio.mean()
+    total = (log_radius - log_radius.mean()).square().sum()
+    return 1.0 - residual.square().sum() / total.masked_fill(
+        total == 0, float("nan")
+    )
+
+
+def log_radius_scale_std(
+    scale: torch.Tensor,
+    radius: torch.Tensor,
+) -> torch.Tensor:
+    _, log_ratio = _log_radius_scale_ratio(scale, radius)
+    return log_ratio.std(unbiased=False)
